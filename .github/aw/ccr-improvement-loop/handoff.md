@@ -1,6 +1,7 @@
 # CCR Improvement Loop — Session Handoff
 
-_Last updated: 2026-07-13. Branch: `experiments/harvest-pull-request-comments`._
+_Last updated: 2026-07-22. Branch: `experiments/harvest-pull-request-comments`.
+Newest session first; the 2026-07-13 dashboard/metrics session follows below._
 
 This document summarizes the work done in this working session on the
 `ccr-improvement-loop` agentic workflow and its dashboard. It is a handoff for
@@ -18,6 +19,77 @@ team via GitHub Pages and kept low-maintenance.
 This session had three parts: **(A)** backfilling historical data, **(B)**
 redesigning the degenerate `missRate` metric, and **(C)** adding per-slice
 breakdown charts. All work is committed (see [Git state](#git-state)).
+
+---
+
+## Session 2026-07-22 — GitHub API rate-limit optimization
+
+**Goal.** Reduce GitHub API pressure in the PR-fetch path so backfills stop
+hitting the rate limit, and map out how to scale backfill across many repos.
+
+### Code shipped (`scripts/`, all tests green)
+- **#1 — Deleted the unused `commits/{sha}/pulls` call + `commitPrs` field.**
+  Verified written-but-never-read (only consumers were test fixtures). Per-PR
+  cost `6 + 2N` → `6 + N` (N = commits). `fetch-prs.ts`, `types.ts`, fixtures.
+- **#5 — Process-wide request limiter + header-aware backoff** (`utils.ts`):
+  new `Semaphore` class + shared `ghRequestLimiter` (default **8**, override via
+  `CCR_GH_MAX_CONCURRENCY`) bounds concurrent REST+GraphQL requests;
+  `parseRetryAfterMs` makes retries honor `Retry-After`; new async
+  `ghApiGraphqlAsync`. Targets **secondary** rate limits (burst/concurrency),
+  which enterprise tier never relaxes.
+- **#2 — Bounded parallel fan-out** (`fetch-prs.ts`): per-PR reads +
+  `fetchThreadResolution` run under one `Promise.all`; per-commit detail under a
+  second (order-preserving). All admitted through the shared limiter, so
+  `workers × fan-out` can't exceed the ceiling.
+- **Deferred:** #3 (selective commit-detail — blocked by `distinctFiles`
+  coupling in `prep-summary.ts`) and #4 (GraphQL migration — partial win,
+  connections still paginate). Rationale in `optimize-api-call-plan.md`.
+
+### New docs
+- **`optimize-api-call-plan.md`** — the #1–#5 items, status, and test plan.
+- **`api-rate-limit.md`** — ground-up reference: cost model, primary vs secondary
+  limits, the token finding, scaling levers, enterprise (GHEC/GHES) implications.
+
+### Key findings
+- **Auth is the real ceiling.** Prep steps run with
+  `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` (workflow `.md`). On the personal
+  `gh-aw-trial` repo that's **~1,000 req/hr** — consistent with runs dying at
+  ~70 PRs. The workflow comment says "App installation rate limit" but the code
+  uses the default token (a gap).
+- **Enterprise (GHEC) uplift:** `GITHUB_TOKEN` → **15,000 req/hr/repo** (15×,
+  no code change), likely removing the need for a custom App. GHES admins can
+  raise/disable limits. Secondary limits are **unchanged** by tier, so the
+  limiter stays essential. ([REST rate-limit docs](https://docs.github.com/enterprise-cloud@latest/rest/overview/rate-limits-for-the-rest-api))
+- **Python volume (2026 merged PRs/mo):** Jan 178, Feb 267, Mar 296, Apr 282,
+  May 326, Jun 288, Jul 230 (MTD). A full month ≈ **~4,000+** endpoint
+  invocations — over a 1,000/hr budget, at/near a 5,000/hr one.
+
+### Dispatch experiments (`JennyPng/gh-aw-trial`)
+- Pushed the code changes to `trial/main` (commit `f01e85f21`, fast-forward).
+- Dispatched a **capped** June 2026 run (`max_prs=75`) → cancelled at user
+  request.
+- Dispatched an **uncapped** June 2026 run (`max_prs=0`) → **hit the rate
+  limit** — confirming the ~1,000/hr `GITHUB_TOKEN` ceiling is the binding
+  constraint for full-cohort months on this (personal) repo.
+
+### Recommended next steps
+1. **Upgrade auth** — App installation token, or host the workflow on a
+   GHEC-owned repo (→ 15,000/hr). Highest-leverage change for scale.
+2. **Keep the limiter** (#5) regardless of tier — the only guard vs secondary
+   limits.
+3. **Multi-repo / deep backfill:** switch to **weekly windows** (~70 PRs ≈
+   ~1,000 calls, clears the ≥50-PR artifact threshold) + a **`/rate_limit`-aware
+   resumable loop** riding the existing immutable `pr-cache` (idempotent
+   re-dispatch, zero rework). Scales to arbitrary repo counts by self-throttling.
+4. **More REST headroom:** land **#4 (GraphQL)** to tap the separate GraphQL
+   point budget, and **#3** to shrink the `N` term.
+
+### Validation (from `.github/aw/ccr-improvement-loop`)
+| Gate | Command | Result |
+|------|---------|--------|
+| Typecheck | `npm run typecheck` | pass |
+| Full suite | `npm test` (vitest) | 97/97 (added `tests/utils.test.ts`) |
+| Lint | `npm run lint` | clean |
 
 ---
 
@@ -169,13 +241,18 @@ shell wrapper blocks `kill $VAR` (use literal PIDs). `gh aw compile` = v0.80.9.
 
 - **Branch:** `experiments/harvest-pull-request-comments`.
 - **Session commits:**
+  - `f01e85f21` — `ccr-improvement-loop: cut GitHub API pressure in fetch-prs`
+    (2026-07-22: #1 deletion, #5 limiter, #2 parallel fan-out, `optimize-api-call-plan.md`)
   - `47cfe3042` — `add max_prs backfill input for rate-limit-safe capped runs`
   - `a76425279` — `many new charts, alter missrate to catch rate` (the metric
     redesign, data migration, and slice charts — 31 files)
 - **Remotes:** `origin` = JennyPng/azure-sdk-tools, `trial` = JennyPng/gh-aw-trial,
-  `upstream` = Azure/azure-sdk-tools. `a76425279` is present on
-  `upstream/experiments/harvest-pull-request-comments`.
-- Working tree is **clean**.
+  `upstream` = Azure/azure-sdk-tools. `a76425279` is on
+  `upstream/experiments/harvest-pull-request-comments`; `f01e85f21` was pushed to
+  `trial/main` (where the workflow runs) as a fast-forward.
+- **Uncommitted (2026-07-22):** `api-rate-limit.md` and this `handoff.md` update
+  are staged/working-tree only — commit + push to `trial/main` if you want the
+  workflow repo to carry them.
 
 ---
 
@@ -206,3 +283,7 @@ shell wrapper blocks `kill $VAR` (use literal PIDs). `gh aw compile` = v0.80.9.
 | `dashboard/data/*.json` + `manifest.json` | The 8 live runs the dashboard reads. |
 | `decisions.md` | Design-decision log (see **D14** for the metric redesign). |
 | `README.md` | Metric definitions and rationale (Q1–Q4). |
+| `scripts/utils.ts` | `Semaphore` + `ghRequestLimiter` (concurrency cap), `ghApiJsonAsync`/`ghApiGraphqlAsync`, header-aware backoff. |
+| `scripts/fetch-prs.ts` | PR fetch/cache; bounded parallel fan-out (`fetchPrToCache`). |
+| `optimize-api-call-plan.md` | API-call optimization items #1–#5, status, test plan. |
+| `api-rate-limit.md` | Rate-limit reference: cost model, primary/secondary limits, token/enterprise, scaling levers. |

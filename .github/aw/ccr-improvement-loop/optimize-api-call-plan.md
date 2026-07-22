@@ -161,6 +161,158 @@ full suite (97 tests) green.
 
 ---
 
+## 6. Move per-commit detail to local git — PROPOSED (attacks the `N` term off-budget) 🔬
+
+The dominant `N` term is Phase 3 of `fetchPrToCache` (`scripts/fetch-prs.ts`):
+one `GET /commits/{sha}` REST call per commit, purely to obtain files + patches +
+commit time. **Every field it writes is a native git concept**, so it can be
+sourced from a local clone with **zero GitHub API calls**:
+
+| Written field (`fetch-prs.ts`, ~L403–L409) | Local-git source (no API) |
+|---|---|
+| `sha` | `git rev-list` / `git log` |
+| `committedAt` | `git log --format=%cI <sha>` (committer date, matching the current `c.commit.committer?.date` preference) |
+| `files` (filenames) | `git diff-tree --no-commit-id --name-only -r <sha>` |
+| `patches` (per-file diff text) | `git show <sha>` / `git diff` |
+
+**Why this is different from #3/#4 (and stronger).** Both prior items failed
+*specifically on patches*: #3 is blocked by the `distinctFiles` coupling, and #4
+notes per-commit file patches "are not cleanly available in GraphQL, so the
+dominant `N` term stays on REST regardless." Git yields patches natively. Crucially,
+**git-protocol operations do not draw from the REST or GraphQL rate-limit pools** —
+they use the separate, far more generous git transport budget. So this does not
+*shrink* `N`; it **removes `N` from the rate-limited path entirely**, leaving the
+per-PR API cost at ≈ `6 + 0` (the fixed calls only).
+
+**Feasibility / caveats:**
+- The workflow can be dispatched against any repo (per the README), including very
+  large ones (`azure-sdk-for-python`). Use a **blobless partial clone**
+  (`git clone --filter=blob:none`) so history is cheap and blobs are fetched on
+  demand — do **not** full-clone up front.
+- CI checkout is usually shallow (`fetch-depth: 1`); this needs `fetch-depth: 0`
+  or targeted `git fetch origin <sha>` for exactly the mined commits.
+- Trade-off is local git CPU/bandwidth vs. API budget — the correct direction when
+  the primary REST ceiling (not disk) is what fails runs.
+- **Cannot** replace the fixed GraphQL call: thread `isResolved` + linked issues
+  are GitHub review-model state, absent from git. Reviews/comments likewise stay
+  on the API. Git only eliminates the commit-detail term.
+- Preserve the existing `distinctFiles` contract (`prep-summary.ts:78-82`) and
+  per-commit `committedAt` attribution (`attribute-comments.ts`,
+  `build-judge-input.ts`) — the git-derived `files`/`committedAt` must be
+  field-equivalent to today's REST-derived values (golden-output test, as in #3).
+
+**Effect:** per-PR API cost `6 + N` → **`6`** on the rate-limited path; the `N`
+work shifts to git. Directly relieves the primary-budget ceiling that #3/#4 left
+intact.
+
+## 7. Batch the fixed calls via GraphQL aliasing — PROPOSED (extends #4) 🔬
+
+#4 already frames "one GraphQL query per PR" to collapse the 5 fixed REST reads.
+The **batching** angle adds what #4 does not: GraphQL **aliasing puts multiple
+PRs (or commits) in a single HTTP request**:
+
+```graphql
+{ p0: repository(...) { pullRequest(number: 101) { ... } }
+  p1: repository(...) { pullRequest(number: 102) { ... } } }
+```
+
+**Two wins beyond plain #4:**
+- **Separate budget pool** — GraphQL is point-metered (~5,000 points/hr)
+  independent of the REST hourly budget (already noted in
+  `api-rate-limit.md §4, Lever 2`); the fixed calls move off the REST ceiling.
+- **Fewer HTTP requests → direct secondary-limit relief** — batching N PRs into a
+  few requests structurally lowers in-flight count, which is exactly what the #5
+  `Semaphore` fights. This reduces burst pressure rather than merely throttling it.
+
+**Hard limits (unchanged from #4):**
+- Connections still paginate (threads@100, linked issues/labels@20); a batched
+  query needs cursor loops + field-equivalence tests vs. the fully-paginated REST
+  path. Batching multiplies pagination complexity across aliases.
+- **GraphQL still does not expose commit patch text**, so batching cannot touch
+  the `N` term — that is #6's job, not this one.
+- Point cost scales with node count, so an over-wide batch can exhaust the GraphQL
+  pool or trip GraphQL's own CPU-cost guard; batch width must be tuned and still
+  admitted through `ghRequestLimiter`.
+
+**Effect:** the fixed `6` moves onto the separate GraphQL pool in batched requests.
+Composed with **#6** (which removes `N`), per-PR consumption on the *primary REST*
+budget — the ceiling that actually fails runs — drops toward **near zero**. That
+is a qualitative shift beyond #1–#5, which all left the primary REST path loaded.
+
+## 8. Cloud pacer — spread dispatches under the hourly refill — PROPOSED (Lever 3 + Lever 4) 🔬
+
+#1–#7 reduce cost *per PR*; #8 is orthogonal — it bounds cost *per hour* by
+spacing whole runs across GitHub's hourly budget refill, so an arbitrarily large
+backlog (`repos × windows`) drains without any single hour exceeding the ceiling.
+Fully async in the cloud: a `cron` **is** the pacing clock — no always-on process,
+no in-run waiting. This is the concrete build of `api-rate-limit.md §4` Levers 3
+(spread) and 4 (orchestrate).
+
+**What already supports it (verified in
+`.github/workflows/ccr-improvement-loop.md`):**
+- The workflow is `workflow_dispatch`-able with `repo`, `window_start`,
+  `window_end`, `max_prs` inputs — an orchestrator can hand it precisely-sized
+  chunks.
+- `concurrency: group: ccr-loop-${repo}`, `cancel-in-progress: false` — the
+  per-repo group already serializes runs (1 running + 1 pending), so a pacer can
+  never stack overlapping runs on the same repo.
+- The immutable `pr-*.json` cache makes each dispatch idempotent, so a resumed
+  continuation re-processes nothing (#1–#7's cache invariant).
+
+**Design — a second workflow `ccr-pacer.yml`** (`schedule: cron` hourly +
+`workflow_dispatch`):
+1. Read a **backlog** of `(repo, window)` jobs — a `repos × months` matrix stored
+   as a committed JSON file, an Actions artifact, or a repo variable.
+2. `gh api rate_limit` → read remaining **primary** budget for the dispatching
+   token (free, read-only).
+3. If `remaining > threshold`, pop the next 1–N jobs and dispatch the child:
+   ```bash
+   gh workflow run ccr-improvement-loop \
+     -f repo=Azure/azure-sdk-for-python \
+     -f window_start=2026-06-01 -f window_end=2026-06-30 -f max_prs=0
+   ```
+4. Mark those jobs dispatched (update the state file/variable).
+5. Exit. Next hour, `cron` fires again and drains the next chunk.
+
+The cron cadence *is* the throttle: one window of ~70 PRs ≈ ~1,000 calls fits one
+hour under the 1,000/hr `GITHUB_TOKEN` ceiling (§3), so ~1 window/hour stays under
+budget with zero in-run waiting. On an App/PAT (5,000/hr) the pacer can release
+~4–5 windows/hour, or one uncapped monthly window.
+
+**Three GitHub-specific blockers (must be designed around):**
+1. **The default `GITHUB_TOKEN` cannot trigger another workflow** — events it
+   dispatches are suppressed to prevent recursion. The pacer must dispatch the
+   child with a **PAT or GitHub App token** (`secrets.PACER_TOKEN`). This aligns
+   with Lever 1 (moving off the 1,000/hr ceiling anyway).
+2. **Cross-run cache persistence is NOT currently wired** — today `CCR_CACHE` is
+   `${{ github.workspace }}/.ccr-cache`, written fresh each run with **no**
+   `actions/cache` restore or artifact download. So the "resume with zero rework"
+   benefit is only *potential*: it requires adding `actions/cache` (keyed by
+   `repo` + window) or artifact upload/download of the `pr-*.json` cache. Until
+   that is added, each dispatch re-fetches its window from scratch — the pacer
+   still bounds calls/hour, but resume/idempotency across runs does not yet hold.
+3. **Do not `sleep` to pace** — in-job sleeps burn runner minutes for nothing.
+   Use the cron cadence for spacing; `cron` is imprecise under load, but spacing
+   (not precision) is what's wanted.
+
+**Budget note.** If pacer and children share one token they share one budget;
+**separate credentials per repo → separate budgets** (Lever 1), so repos stop
+competing. Regardless of tier the in-process `Semaphore`/`ghRequestLimiter` (#5)
+stays essential — the pacer spaces the *primary* budget across hours, but only the
+limiter guards the *secondary* (burst) limits, which dispatch-level pacing can't
+see.
+
+**Variant — self-re-dispatch.** The child, on low `/rate_limit` remaining or
+hitting `max_prs`, appends its continuation to the backlog (or re-dispatches
+itself). Same two prerequisites: the PAT (blocker #1) and persisted cache
+(blocker #2).
+
+**Effect:** decouples total backlog size from the per-hour ceiling — the clean
+pattern for multi-repo / deep backfill. Composes with #1–#7 (cheaper runs) and
+Lever 1 (higher ceiling) rather than replacing them.
+
+---
+
 ## Sequencing — STATUS
 
 1. **#1 dead-code deletion** — ✅ DONE (`6+2N` → `6+N`).
@@ -171,6 +323,19 @@ full suite (97 tests) green.
    refactor.
 5. **#4 GraphQL migration** — 🕐 DEFERRED: partial win, high effort; revisit only
    if real runs still hit the ceiling.
+6. **#6 local-git commit detail** — 🔬 PROPOSED: moves the dominant `N` term off
+   the rate-limited path entirely (git transport budget); the structural fix #3/#4
+   couldn't reach because both were blocked on patches. Needs partial-clone +
+   `fetch-depth: 0` and field-equivalence golden tests.
+7. **#7 GraphQL-batched fixed calls** — 🔬 PROPOSED: aliases multiple PRs into
+   batched GraphQL requests on the separate point pool; relieves secondary limits.
+   Composes with #6 to drive primary-REST cost toward zero. Blocked on the same
+   pagination/field-equivalence work as #4; cannot touch `N` (patches).
+8. **#8 cloud pacer** — 🔬 PROPOSED: hourly `cron` orchestrator drains a
+   `repos × windows` backlog, one chunk/hour under a `rate_limit` check — fully
+   async in the cloud. Orthogonal to #1–#7 (bounds cost *per hour*, not per PR).
+   Prereqs: a PAT/App token (default `GITHUB_TOKEN` can't trigger workflows) and
+   cross-run cache persistence (not currently wired).
 
 Net shipped: fewer requests per PR (#1) **and** those requests now issued
 concurrently under a hard, header-aware secondary-rate-limit ceiling (#2 + #5).
