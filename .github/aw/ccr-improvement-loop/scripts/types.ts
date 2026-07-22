@@ -172,8 +172,6 @@ export interface PullRequestData {
     inline: InlineComment[];
     issue: IssueComment[];
     commits: TimelineCommit[];
-    /** sha → PR numbers that merged the commit (GET /commits/{sha}/pulls). */
-    commitPrs?: Record<string, number[]>;
 }
 
 // ---------------------------------------------------------------------------

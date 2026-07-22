@@ -3,14 +3,20 @@
  * fetch-prs.ts — fetch PRs in a window and cache the raw REST+GraphQL payloads
  * attribution needs: reviews (author + association + state), inline comments
  * (path/line/startLine/originalLine + thread isResolved + reactions), issue
- * comments (+ reactions), the commit timeline ({sha, files, committedAt}), and
- * commit→PR mapping (GET /commits/{sha}/pulls).
+ * comments (+ reactions), and the commit timeline ({sha, files, committedAt}).
  *
  * Contract: full pagination, versioned cache (rawSchemaVersion),
  * documented secondary-rate-limit backoff (utils.ghApiJsonAsync), and
  * edited/deleted comments are immutable once cached (only --refresh refetches).
  * Distinct ID namespaces (review comment vs review body vs issue comment) are
  * preserved, never merged.
+ *
+ * NOTE: we intentionally do NOT fetch commit→PR mapping (GET
+ * /commits/{sha}/pulls). It was unused by every downstream consumer and cost one
+ * request per commit. Its only real use would be filtering base-branch/merge
+ * commits out of the attribution timeline for repos that allow merge commits; if
+ * such a repo is ever targeted, wire that mapping back in (keep a commit only if
+ * its introducing PR == this PR) rather than reintroducing it unused.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -29,6 +35,7 @@ import type {
 } from "./types.ts";
 import { RAW_SCHEMA_VERSION } from "./run-schema.ts";
 import {
+    ghApiGraphqlAsync,
     ghApiJsonAsync,
     ghJsonSync,
     makeLogger,
@@ -311,21 +318,19 @@ interface ThreadGraphQl {
     };
 }
 
-function fetchThreadResolution(
+async function fetchThreadResolution(
     repo: string,
     number: number,
-): {
+): Promise<{
     resolvedByCommentId: Map<number, boolean>;
     linkedIssues: { number: number; labels: string[] }[];
-} {
+}> {
     const [owner, name] = repo.split("/");
     const query = `query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){pullRequest(number:$num){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{databaseId}}}} closingIssuesReferences(first:20){nodes{number labels(first:20){nodes{name}}}}}}}`;
     const resolvedByCommentId = new Map<number, boolean>();
     const linkedIssues: { number: number; labels: string[] }[] = [];
     try {
-        const res = ghJsonSync<ThreadGraphQl>([
-            "api",
-            "graphql",
+        const res = await ghApiGraphqlAsync<ThreadGraphQl>([
             "-f",
             `query=${query}`,
             "-F",
@@ -368,52 +373,42 @@ async function fetchPrToCache(
     fs.mkdirSync(cacheDir, { recursive: true });
 
     const base = `repos/${repo}`;
-    const prRaw = await ghApiJsonAsync<RawPrFull>(`${base}/pulls/${number}`);
-    const reviewsRaw = await ghApiJsonAsync<RawReview[]>(
-        `${base}/pulls/${number}/reviews`,
-    );
-    const inlineRaw = await ghApiJsonAsync<RawInline[]>(
-        `${base}/pulls/${number}/comments`,
-    );
-    const issueRaw = await ghApiJsonAsync<RawIssue[]>(
-        `${base}/issues/${number}/comments`,
-    );
-    const commitsRaw = await ghApiJsonAsync<RawCommit[]>(
-        `${base}/pulls/${number}/commits`,
-    );
-    const { resolvedByCommentId, linkedIssues } = fetchThreadResolution(
-        repo,
-        number,
-    );
+    // Independent per-PR reads run concurrently; the shared ghRequestLimiter
+    // (utils.ts) bounds total in-flight requests so parallel workers × this
+    // fan-out never exceed GitHub's secondary-rate-limit concurrency ceiling.
+    const [prRaw, reviewsRaw, inlineRaw, issueRaw, commitsRaw, threadRes] =
+        await Promise.all([
+            ghApiJsonAsync<RawPrFull>(`${base}/pulls/${number}`),
+            ghApiJsonAsync<RawReview[]>(`${base}/pulls/${number}/reviews`),
+            ghApiJsonAsync<RawInline[]>(`${base}/pulls/${number}/comments`),
+            ghApiJsonAsync<RawIssue[]>(`${base}/issues/${number}/comments`),
+            ghApiJsonAsync<RawCommit[]>(`${base}/pulls/${number}/commits`),
+            fetchThreadResolution(repo, number),
+        ]);
+    const { resolvedByCommentId, linkedIssues } = threadRes;
 
-    const commits: TimelineCommit[] = [];
-    const commitPrs: Record<string, number[]> = {};
-    for (const c of commitsRaw) {
-        const filesRes = await ghApiJsonAsync<RawCommitFiles>(
-            `${base}/commits/${c.sha}`,
-        );
-        const files = filesRes.files ?? [];
-        const patches = Object.fromEntries(
-            files
-                .filter((f) => f.patch != null)
-                .map((f) => [f.filename, f.patch ?? ""]),
-        );
-        commits.push({
-            sha: c.sha,
-            committedAt:
-                c.commit.committer?.date ?? c.commit.author?.date ?? null,
-            files: files.map((f) => f.filename),
-            ...(Object.keys(patches).length > 0 ? { patches } : {}),
-        });
-        try {
-            const prs = await ghApiJsonAsync<{ number: number }[]>(
-                `${base}/commits/${c.sha}/pulls`,
+    // Per-commit detail (files/patches) is fetched concurrently too; Promise.all
+    // preserves commit order and the limiter keeps the burst bounded.
+    const commits: TimelineCommit[] = await Promise.all(
+        commitsRaw.map(async (c): Promise<TimelineCommit> => {
+            const filesRes = await ghApiJsonAsync<RawCommitFiles>(
+                `${base}/commits/${c.sha}`,
             );
-            commitPrs[c.sha] = prs.map((p) => p.number);
-        } catch {
-            commitPrs[c.sha] = [];
-        }
-    }
+            const files = filesRes.files ?? [];
+            const patches = Object.fromEntries(
+                files
+                    .filter((f) => f.patch != null)
+                    .map((f) => [f.filename, f.patch ?? ""]),
+            );
+            return {
+                sha: c.sha,
+                committedAt:
+                    c.commit.committer?.date ?? c.commit.author?.date ?? null,
+                files: files.map((f) => f.filename),
+                ...(Object.keys(patches).length > 0 ? { patches } : {}),
+            };
+        }),
+    );
 
     const meta: PullRequestMetadata = {
         number: prRaw.number,
@@ -467,7 +462,6 @@ async function fetchPrToCache(
             reactions: mapReactions(c.reactions),
         })),
         commits,
-        commitPrs,
     };
 
     fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));

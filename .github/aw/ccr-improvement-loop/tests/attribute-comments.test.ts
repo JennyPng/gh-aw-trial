@@ -91,7 +91,6 @@ describe("attribute-comments (fixture)", () => {
                 },
             ],
             commits: [],
-            commitPrs: {},
         };
         const replyRows = attributePr(replyData, new Set([900]), cfg);
         expect(byId(replyRows, 900).kind).toBe("reply");
@@ -310,7 +309,6 @@ describe("rowId uniqueness", () => {
             ],
             issue: [],
             commits: [],
-            commitPrs: {},
         };
     }
 

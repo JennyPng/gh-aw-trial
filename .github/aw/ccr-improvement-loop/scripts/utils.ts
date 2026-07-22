@@ -187,19 +187,131 @@ export function ghApiJsonPaginatedSync<T>(endpoint: string): T {
 }
 
 /**
- * Async, paginated variant of {@link ghApiJsonSync}. Runs `gh api --paginate`
- * via `spawn` so callers can overlap requests behind a concurrency runner.
- * Implements bounded retry with backoff on secondary-rate-limit / 5xx errors.
+ * A counting semaphore that bounds how many async operations run at once.
+ * Used to cap concurrent `gh` API requests process-wide: GitHub's secondary
+ * rate limits punish bursts / high concurrency independently of the primary
+ * hourly quota, so the ceiling matters even when quota remains.
+ */
+export class Semaphore {
+    private inFlight = 0;
+    private readonly waiters: (() => void)[] = [];
+    private readonly max: number;
+
+    constructor(max: number) {
+        if (!Number.isFinite(max) || max < 1) {
+            throw new Error("Semaphore max must be >= 1");
+        }
+        this.max = max;
+    }
+
+    /** Number of currently acquired (in-flight) slots. */
+    get active(): number {
+        return this.inFlight;
+    }
+
+    /** Run `fn` once a slot is free, releasing the slot when it settles. */
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+        await this.acquire();
+        try {
+            return await fn();
+        } finally {
+            this.release();
+        }
+    }
+
+    private acquire(): Promise<void> {
+        if (this.inFlight < this.max) {
+            this.inFlight++;
+            return Promise.resolve();
+        }
+        return new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+
+    private release(): void {
+        const next = this.waiters.shift();
+        if (next) {
+            // Hand the slot straight to the next waiter (inFlight unchanged).
+            next();
+        } else {
+            this.inFlight--;
+        }
+    }
+}
+
+/**
+ * Extract a wait duration (ms) from a gh/GitHub error carrying a `Retry-After`
+ * header or a "retry after N seconds" phrase. Returns null when no explicit
+ * delay is advertised so callers fall back to exponential backoff. Honoring the
+ * server-advertised delay is the correct response to a secondary rate limit.
+ */
+export function parseRetryAfterMs(message: string): number | null {
+    const header = /retry-after:\s*(\d+)/i.exec(message);
+    if (header) return Number(header[1]) * 1000;
+    const phrase = /retry after (\d+) second/i.exec(message);
+    if (phrase) return Number(phrase[1]) * 1000;
+    const wait = /wait (\d+) second/i.exec(message);
+    if (wait) return Number(wait[1]) * 1000;
+    return null;
+}
+
+/**
+ * Global ceiling on concurrent `gh` API requests (REST + GraphQL). Kept well
+ * under GitHub's ~100-concurrent guidance so parallel fan-out (fetch-prs) never
+ * trips secondary rate limits. Override with CCR_GH_MAX_CONCURRENCY.
+ */
+const GH_MAX_CONCURRENCY = (() => {
+    const raw = process.env.CCR_GH_MAX_CONCURRENCY;
+    const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    return Number.isFinite(n) && n >= 1 ? n : 8;
+})();
+
+/** Shared limiter every async `gh` request is admitted through. */
+export const ghRequestLimiter = new Semaphore(GH_MAX_CONCURRENCY);
+
+/**
+ * Async, paginated variant of {@link ghApiJsonSync}. Every request is admitted
+ * through the shared {@link ghRequestLimiter}, so concurrent callers (the
+ * fetch-prs fan-out) stay under the secondary-rate-limit ceiling. Retries with
+ * header-aware backoff on secondary-rate-limit / 5xx errors.
  */
 export async function ghApiJsonAsync<T>(
     endpoint: string,
     opts: { maxRetries?: number } = {},
 ): Promise<T> {
-    const maxRetries = opts.maxRetries ?? 4;
+    return withGhRetry(opts.maxRetries ?? 4, () =>
+        ghRequestLimiter.run(() =>
+            spawnGhJson<T>(
+                ["api", "--paginate", "--slurp", endpoint],
+                endpoint,
+            ),
+        ),
+    );
+}
+
+/**
+ * Async GraphQL request, admitted through the same {@link ghRequestLimiter} and
+ * retry path as REST so it counts against the same concurrency ceiling. `fields`
+ * are the `gh api graphql` arguments after the subcommand (e.g. `-f query=…`).
+ */
+export async function ghApiGraphqlAsync<T>(
+    fields: string[],
+    opts: { maxRetries?: number } = {},
+): Promise<T> {
+    return withGhRetry(opts.maxRetries ?? 4, () =>
+        ghRequestLimiter.run(() =>
+            spawnGhJson<T>(["api", "graphql", ...fields], "graphql"),
+        ),
+    );
+}
+
+async function withGhRetry<T>(
+    maxRetries: number,
+    fn: () => Promise<T>,
+): Promise<T> {
     let attempt = 0;
     for (;;) {
         try {
-            return await ghApiJsonOnce<T>(endpoint);
+            return await fn();
         } catch (err) {
             attempt++;
             const msg = err instanceof Error ? err.message : String(err);
@@ -208,17 +320,18 @@ export async function ghApiJsonAsync<T>(
                     msg,
                 );
             if (!retriable || attempt > maxRetries) throw err;
-            const backoffMs = Math.min(60_000, 1000 * 2 ** (attempt - 1));
+            // Prefer the server-advertised Retry-After; else exponential backoff.
+            const backoffMs =
+                parseRetryAfterMs(msg) ??
+                Math.min(60_000, 1000 * 2 ** (attempt - 1));
             await sleep(backoffMs);
         }
     }
 }
 
-function ghApiJsonOnce<T>(endpoint: string): Promise<T> {
+function spawnGhJson<T>(args: string[], label: string): Promise<T> {
     return new Promise((resolve, reject) => {
-        const child = spawn("gh", ["api", "--paginate", "--slurp", endpoint], {
-            stdio: ["ignore", "pipe", "pipe"],
-        });
+        const child = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"] });
 
         let stdout = "";
         let stderr = "";
@@ -239,15 +352,13 @@ function ghApiJsonOnce<T>(endpoint: string): Promise<T> {
         });
         child.on("close", (code) => {
             if (code !== 0) {
-                reject(
-                    new Error(`gh api ${endpoint} failed: ${stderr.trim()}`),
-                );
+                reject(new Error(`gh api ${label} failed: ${stderr.trim()}`));
                 return;
             }
             try {
                 const parsed: unknown = JSON.parse(stdout);
-                // `gh api --paginate --slurp` wraps every page in one JSON
-                // array. Collapse it back to what callers expect.
+                // `--paginate --slurp` wraps pages in one array; GraphQL returns
+                // a lone object. flattenSlurpedPages handles both.
                 resolve(flattenSlurpedPages<T>(parsed));
             } catch (err) {
                 reject(err instanceof Error ? err : new Error(String(err)));

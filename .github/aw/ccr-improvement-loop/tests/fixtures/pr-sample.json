@@ -146,6 +146,5 @@
       "committedAt": "2026-06-01T12:00:00Z",
       "files": ["src/bar.ts", "src/generated/api.ts"]
     }
-  ],
-  "commitPrs": { "c1": [100], "c2": [100] }
+  ]
 }

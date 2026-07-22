@@ -99,7 +99,6 @@ describe("build-judge-input", () => {
             ],
             issue: [],
             commits: [],
-            commitPrs: {},
         };
 
         const rows = attributePr(data, new Set([810, 811]), cfg);
