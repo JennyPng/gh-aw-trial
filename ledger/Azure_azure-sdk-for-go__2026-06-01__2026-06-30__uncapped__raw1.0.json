@@ -1,0 +1,13 @@
+{
+  "window_id": "Azure_azure-sdk-for-go__2026-06-01__2026-06-30__uncapped__raw1.0",
+  "repo": "Azure/azure-sdk-for-go",
+  "window_start": "2026-06-01",
+  "window_end": "2026-06-30",
+  "cohort": "uncapped",
+  "schema_version": "1.0",
+  "outcome": "failed",
+  "attempt": 1,
+  "run_id": "30124922457",
+  "artifact_name": "run-Azure_azure-sdk-for-go__2026-06-01__2026-06-30__uncapped__raw1.0",
+  "ts": "2026-07-24T20:56:53.956Z"
+}
