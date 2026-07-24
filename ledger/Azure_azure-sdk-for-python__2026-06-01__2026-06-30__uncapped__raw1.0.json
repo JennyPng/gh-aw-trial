@@ -1,0 +1,13 @@
+{
+  "window_id": "Azure_azure-sdk-for-python__2026-06-01__2026-06-30__uncapped__raw1.0",
+  "repo": "Azure/azure-sdk-for-python",
+  "window_start": "2026-06-01",
+  "window_end": "2026-06-30",
+  "cohort": "uncapped",
+  "schema_version": "1.0",
+  "outcome": "produced",
+  "attempt": 1,
+  "run_id": "30129518458",
+  "artifact_name": "run-Azure_azure-sdk-for-python__2026-06-01__2026-06-30__uncapped__raw1.0",
+  "ts": "2026-07-24T22:05:30.109Z"
+}
