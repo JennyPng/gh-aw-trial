@@ -1,0 +1,9 @@
+{
+  "windows": [
+    {
+      "window_id": "Azure_azure-sdk-for-go__2026-06-01__2026-06-30__uncapped__raw1.0",
+      "reason": "exceeded retry cap (1) after 2 failed attempts",
+      "ts": "2026-07-24T21:15:00.311Z"
+    }
+  ]
+}
