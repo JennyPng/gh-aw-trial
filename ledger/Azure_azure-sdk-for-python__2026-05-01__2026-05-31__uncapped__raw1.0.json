@@ -6,8 +6,9 @@
   "cohort": "uncapped",
   "schema_version": "1.0",
   "outcome": "failed",
+  "failure_kind": "transient",
   "attempt": 1,
-  "run_id": "30295521929",
+  "run_id": "30303917812",
   "artifact_name": "run-Azure_azure-sdk-for-python__2026-05-01__2026-05-31__uncapped__raw1.0",
-  "ts": "2026-07-27T19:00:37.459Z"
+  "ts": "2026-07-27T20:51:21.838Z"
 }
