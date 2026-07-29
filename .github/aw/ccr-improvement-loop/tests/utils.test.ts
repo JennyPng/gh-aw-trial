@@ -5,7 +5,11 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { Semaphore, parseRetryAfterMs } from "../scripts/utils.ts";
+import {
+    Semaphore,
+    parseRetryAfterMs,
+    isTransientFailureMessage,
+} from "../scripts/utils.ts";
 
 describe("Semaphore", () => {
     it("never exceeds the configured ceiling under heavy fan-out", async () => {
@@ -67,5 +71,34 @@ describe("parseRetryAfterMs", () => {
 
     it("returns null when no explicit delay is advertised", () => {
         expect(parseRetryAfterMs("secondary rate limit hit")).toBeNull();
+    });
+});
+
+describe("isTransientFailureMessage", () => {
+    it("flags rate-limit, abuse, 5xx, and timeout messages as transient", () => {
+        for (const msg of [
+            "API rate limit exceeded for installation",
+            "You have exceeded a secondary rate limit",
+            "You have triggered an abuse detection mechanism",
+            "was submitted too quickly",
+            "gh: Something went wrong (HTTP 502)",
+            "request timeout",
+        ]) {
+            expect(isTransientFailureMessage(msg)).toBe(true);
+        }
+    });
+
+    it("flags GitHub's server-side generation timeout (HTTP 422) as transient", () => {
+        expect(
+            isTransientFailureMessage(
+                "gh api repos/Azure/azure-sdk-for-python/commits/abc failed: gh: The request is taking too long to generate. (HTTP 422)",
+            ),
+        ).toBe(true);
+    });
+
+    it("treats a genuine bad request as hard (not transient)", () => {
+        expect(
+            isTransientFailureMessage("gh: Validation Failed (HTTP 422)"),
+        ).toBe(false);
     });
 });

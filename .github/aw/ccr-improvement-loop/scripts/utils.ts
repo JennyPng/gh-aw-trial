@@ -312,9 +312,14 @@ export async function ghApiGraphqlAsync<T>(
  * "retriable across ticks" can never drift apart. A window that fails with a
  * transient message is re-dispatched when budget allows rather than counted
  * toward the retry cap or retired.
+ *
+ * `taking too long to generate` is GitHub's server-side generation timeout: the
+ * commits/compare APIs return HTTP 422 with that phrase when the response can't
+ * be built in time. It is a retriable infra hiccup (not a bad request), so it
+ * must classify transient even though 422 is not a 5xx.
  */
 export const TRANSIENT_FAILURE_RE =
-    /rate limit|secondary rate|abuse|was submitted too quickly|HTTP 5\d\d|timeout/i;
+    /rate limit|secondary rate|abuse|was submitted too quickly|HTTP 5\d\d|timeout|taking too long to generate/i;
 
 /** True when `message` looks like a transient (retriable) GitHub failure. */
 export function isTransientFailureMessage(message: string): boolean {
